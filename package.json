@@ -15,8 +15,8 @@
     "test:unit": "vitest run test/unit",
     "migrate": "tsx scripts/migrate.ts",
     "seed": "tsx scripts/seed.ts",
-    "start:api": "node dist/server.js",
-    "start:worker": "node dist/worker.js"
+    "start:api": "node dist/src/server.js",
+    "start:worker": "node dist/src/worker.js"
   },
   "dependencies": {
     "express": "^4.19.2",
@@ -30,6 +30,7 @@
     "@types/node": "^22.5.0",
     "@types/node-cron": "^3.0.11",
     "@types/pg": "^8.11.6",
+    "@types/uuid": "^9.0.8",
     "cross-env": "^7.0.3",
     "tsx": "^4.19.0",
     "typescript": "^5.5.4",

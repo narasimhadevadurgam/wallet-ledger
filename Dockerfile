@@ -20,7 +20,8 @@ COPY --from=build /app/dist ./dist
 COPY migrations ./migrations
 
 # One image, two entrypoints. Compose overrides the command per service:
-#   api    -> node dist/server.js
-#   worker -> node dist/worker.js
+#   api    -> node dist/src/server.js
+#   worker -> node dist/src/worker.js
+# tsconfig rootDir='.' with src/scripts/test included emits under dist/src/.
 # Both entrypoints run migrations on startup before doing work.
-CMD ["node", "dist/server.js"]
+CMD ["node", "dist/src/server.js"]
