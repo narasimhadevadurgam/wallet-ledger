@@ -9,6 +9,15 @@ declare global {
   namespace Express {
     interface Request {
       request_id: string;
+      /**
+       * Set by the `requireIdempotency` middleware on the three money POSTs
+       * (design §8/§11): the validated UUID key and the canonical body hash the
+       * route forwards into transferService. Absent on exempt routes.
+       */
+      idempotency?: {
+        key: string;
+        bodyHash: string;
+      };
     }
   }
 }

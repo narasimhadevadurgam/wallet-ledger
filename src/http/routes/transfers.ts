@@ -1,22 +1,29 @@
 import { Router } from "express";
 import type { Pool } from "pg";
-import { executeTransfer } from "../../services/transferService.js";
+import {
+  executeTransfer,
+  type TransferResult,
+} from "../../services/transferService.js";
 import { getAccount } from "../../services/walletService.js";
 import { AppError } from "../errors.js";
+import { requireIdempotency } from "../idempotency.js";
 import { parseOrThrow, transferSchema } from "../validation.js";
 
 /**
  * Transfer route (design §8):
  *   POST /transfers -> peer transfer (wallet -> wallet), status may be HELD.
  *
- * Money-mutating POST; FEAT-004 adds the Idempotency-Key requirement + replay.
- * The acting user (for audit / idempotency scope) is the owner of
+ * Money-mutating POST: REQUIRES a valid UUID `Idempotency-Key` header. The
+ * `requireIdempotency` middleware rejects a missing/invalid key with
+ * `400 MISSING_IDEMPOTENCY_KEY` before any DB work and computes the body hash;
+ * transferService inserts the key first and detects replay by the unique
+ * violation (§11). The acting user and the §11 keyspace owner is the owner of
  * `from_wallet_id` (design §9.1 / §11). Both sides must be USER wallets.
  */
 export function transfersRouter(pool: Pool): Router {
   const router = Router();
 
-  router.post("/transfers", async (req, res, next) => {
+  router.post("/transfers", requireIdempotency, async (req, res, next) => {
     try {
       const input = parseOrThrow(transferSchema, req.body);
 
@@ -29,28 +36,51 @@ export function transfersRouter(pool: Pool): Router {
         throw new AppError("NOT_FOUND", `wallet ${input.to_wallet_id} is not a user wallet`);
       }
 
-      const result = await executeTransfer(pool, {
+      const requestId = req.request_id;
+      const ownerUserId = source.user_id;
+      const outcome = await executeTransfer(pool, {
         type: "peer_transfer",
         fromAccountId: input.from_wallet_id,
         toAccountId: input.to_wallet_id,
         amount: input.amount,
         note: input.note,
-        actor: source.user_id,
+        actor: ownerUserId,
+        idempotency: {
+          userId: BigInt(ownerUserId),
+          key: req.idempotency!.key,
+          bodyHash: req.idempotency!.bodyHash,
+          buildResponse: (result) => ({
+            code: 201,
+            body: transferBody(result, requestId),
+          }),
+        },
       });
 
-      res.status(201).json({
-        transfer_id: result.transfer_id,
-        status: result.status,
-        type: result.type,
-        amount: result.amount,
-        fee: result.fee,
-        wallet_balance: result.wallet_balance,
-        request_id: req.request_id,
-      });
+      if (outcome.response) {
+        res.status(outcome.response.code).json(outcome.response.body);
+      } else if (outcome.kind === "executed") {
+        res.status(201).json(transferBody(outcome.result, requestId));
+      }
     } catch (err) {
       next(err);
     }
   });
 
   return router;
+}
+
+/** The 201 body for a peer transfer (money as strings; carries request_id). */
+function transferBody(
+  result: TransferResult,
+  requestId: string,
+): Record<string, unknown> {
+  return {
+    transfer_id: result.transfer_id,
+    status: result.status,
+    type: result.type,
+    amount: result.amount,
+    fee: result.fee,
+    wallet_balance: result.wallet_balance,
+    request_id: requestId,
+  };
 }

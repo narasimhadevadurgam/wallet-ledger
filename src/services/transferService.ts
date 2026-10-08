@@ -4,7 +4,6 @@ import { AppError } from "../http/errors.js";
 import { serializeAmount } from "../money/money.js";
 import { writeTransferAudit } from "./auditService.js";
 import {
-  getAccountOnClient,
   getSystemAccount,
   type AccountRecord,
 } from "./walletService.js";
@@ -18,11 +17,14 @@ import {
  *
  * SEAMS for later FEATs — intentionally left as marked hooks so those FEATs
  * EXTEND this method rather than rewrite it:
- *   - FEAT-004 (idempotency, design §9.1 step 3): the `idempotency` field on
- *     TransferContext carries the resolved key + body_hash. The seam
- *     `insertIdempotencyKeyFirst` runs as the first in-transaction write; the
- *     replay path is detected ONLY by the UNIQUE(user_id,key) violation. Today
- *     the field is optional and the seam is a no-op when absent.
+ *   - FEAT-004 (idempotency, design §9.1 step 3 / §11): LIVE. When the optional
+ *     `idempotency` field on TransferContext is set, the key is inserted FIRST
+ *     inside the txn (`insertIdempotencyKeyFirst`); a same-key replay is
+ *     detected SOLELY by the UNIQUE(user_id,key) violation (never by SELECTing
+ *     an in_progress key), the committed response is replayed byte-for-byte, a
+ *     body-hash mismatch → 422, and a rolled-back first attempt persists no key
+ *     so a retry re-executes (Case 2). The field stays optional so non-money
+ *     callers (none today) can still execute without a key.
  *   - FEAT-005 (fraud, design §9.1 step 6): the seam `evaluateFraud` runs AFTER
  *     the funds check and BEFORE ledger writes, under the FOR UPDATE locks, and
  *     may return a HELD outcome (commit with no ledger entries) or a flag.
@@ -32,13 +34,37 @@ import {
 export type TransferType = "top_up" | "peer_transfer" | "withdrawal";
 
 /**
- * Idempotency context (FEAT-004 seam). When present, the key is inserted first
- * inside the transaction and replay is detected by the unique violation.
+ * The HTTP response a money route would send for a freshly-executed transfer:
+ * the status code and the exact JSON body. This is what gets persisted on the
+ * idempotency key at step 11 and replayed byte-for-byte on a later same-key
+ * request (design §11.2). `body` is a plain JSON-serializable object (money as
+ * strings already).
+ */
+export interface TransferResponse {
+  code: number;
+  body: Record<string, unknown>;
+}
+
+/**
+ * Idempotency context (design §9.1 step 3 / §11). When present, the key is
+ * inserted FIRST inside the transfer transaction and a replay is detected
+ * SOLELY by the `UNIQUE(user_id, key)` violation — no code path ever SELECTs an
+ * `in_progress` key to branch on (design §11.2 invariant).
+ *
+ *   - `userId`  — the owning user whose keyspace the key lives in (design §11:
+ *                 owner of `from_wallet_id` for a peer transfer; the path
+ *                 wallet's `accounts.user_id` for top-up/withdraw).
+ *   - `key`     — the client UUID from the `Idempotency-Key` header.
+ *   - `bodyHash`— SHA-256 of the canonicalized body (design §11.1).
+ *   - `buildResponse` — maps the executed result to the exact `{ code, body }`
+ *                 the route will send; stored at step 11 so replays return it
+ *                 byte-for-byte.
  */
 export interface IdempotencyContext {
   userId: bigint;
   key: string;
   bodyHash: string;
+  buildResponse: (result: TransferResult) => TransferResponse;
 }
 
 export interface TransferContext {
@@ -65,24 +91,142 @@ export interface TransferResult {
   wallet_balance: string;
 }
 
+/**
+ * What `executeTransfer` hands back to a money route. Either the transfer ran
+ * fresh (`executed`, carrying the computed `result` and the `response` the
+ * route should send and which was persisted on the key), or a same-key replay
+ * was detected and the saved `response` is returned byte-for-byte with no money
+ * moved (`replay`). When no idempotency context is supplied only `executed` is
+ * possible and `response` is undefined (the route serializes `result` itself).
+ */
+export type TransferOutcome =
+  | { kind: "executed"; result: TransferResult; response?: TransferResponse }
+  | { kind: "replay"; response: TransferResponse };
+
 /** The fraud-seam outcome. FEAT-005 fills in HELD / flag; today always proceed. */
 type FraudDecision =
   | { decision: "proceed" }
   | { decision: "hold"; ruleName: string };
 
+/** Postgres SQLSTATE for a unique-violation (the UNIQUE(user_id,key) conflict). */
+const UNIQUE_VIOLATION = "23505";
+
 /**
- * FEAT-004 SEAM. Insert the idempotency key FIRST (design §9.1 step 3) and
- * detect replay by the UNIQUE(user_id,key) violation. No-op until FEAT-004
- * populates `ctx.idempotency`. FEAT-004 replaces the body of this function; the
- * call site below does not move.
+ * Internal sentinel thrown by `insertIdempotencyKeyFirst` when the step-3 INSERT
+ * hits the `UNIQUE(user_id, key)` violation. It aborts the transfer transaction
+ * (so NO money moves and, per Case 2, an uncommitted key disappears) and is
+ * caught by `executeTransfer` AFTER the rollback, which then resolves the replay
+ * against the COMMITTED key row read on the pool. This is the ONLY replay
+ * trigger — no code path SELECTs an `in_progress` key to branch on (§11.2).
+ */
+class IdempotencyConflict extends Error {
+  constructor() {
+    super("idempotency key conflict");
+    this.name = "IdempotencyConflict";
+  }
+}
+
+/** Narrow an unknown thrown value to a pg error carrying a SQLSTATE `code`. */
+function pgErrorCode(err: unknown): string | undefined {
+  if (err && typeof err === "object" && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * STEP 3 (design §9.1 / §11): insert the idempotency key FIRST, as the very
+ * first in-transaction write, with `status='in_progress'`. On the
+ * `UNIQUE(user_id, key)` violation throw `IdempotencyConflict` to abort the txn
+ * and route the request to the replay path. The `in_progress` row is NEVER read
+ * by any other request to make a decision; replay is detected only here.
  */
 async function insertIdempotencyKeyFirst(
-  _client: PoolClient,
-  _idempotency: IdempotencyContext,
+  client: PoolClient,
+  idempotency: IdempotencyContext,
 ): Promise<void> {
-  // FEAT-004: INSERT INTO idempotency_keys(user_id,key,body_hash,status)
-  //           VALUES (u,k,hash,'in_progress'); on 23505 -> replay path.
-  // Intentionally a no-op seam for FEAT-003.
+  try {
+    await client.query(
+      `INSERT INTO idempotency_keys (user_id, key, body_hash, status)
+       VALUES ($1, $2, $3, 'in_progress')`,
+      [idempotency.userId.toString(), idempotency.key, idempotency.bodyHash],
+    );
+  } catch (err) {
+    if (pgErrorCode(err) === UNIQUE_VIOLATION) {
+      throw new IdempotencyConflict();
+    }
+    throw err;
+  }
+}
+
+/**
+ * STEP 11 (design §9.1): mark the key `completed` and persist the saved HTTP
+ * status + response body (JSONB) so a later same-key request can replay them
+ * byte-for-byte. Runs inside the same transaction as the money movement, so the
+ * saved response and the money commit (or roll back) atomically together.
+ */
+async function completeIdempotencyKey(
+  client: PoolClient,
+  idempotency: IdempotencyContext,
+  response: TransferResponse,
+): Promise<void> {
+  await client.query(
+    `UPDATE idempotency_keys
+       SET status = 'completed', response_code = $4, response_body = $5
+     WHERE user_id = $1 AND key = $2 AND body_hash = $3`,
+    [
+      idempotency.userId.toString(),
+      idempotency.key,
+      idempotency.bodyHash,
+      response.code,
+      JSON.stringify(response.body),
+    ],
+  );
+}
+
+/**
+ * Resolve a replay against the COMMITTED key row (design §11.2 Case 1). Read on
+ * the POOL, AFTER the transfer txn rolled back on the unique violation — the
+ * row that caused the conflict is committed, so there is no `in_progress` read
+ * here. If the stored `body_hash` matches, return the saved `response_code` +
+ * `response_body` exactly (no money moved); if it differs → `422
+ * IDEMPOTENCY_BODY_MISMATCH`. A row still `in_progress` (its owner has not yet
+ * committed) means the conflict came from an uncommitted insert that has since
+ * been resolved; we never replay such a row — it either committed (completed,
+ * handled here) or rolled back (no row, handled by Case 2 re-execute, which
+ * means we would not have conflicted). We treat an absent/non-completed row as
+ * a race the caller should re-execute by surfacing the original conflict.
+ */
+async function resolveReplay(
+  pool: Pool,
+  idempotency: IdempotencyContext,
+): Promise<TransferResponse> {
+  const result = await pool.query<{
+    body_hash: string;
+    status: string;
+    response_code: number | null;
+    response_body: Record<string, unknown> | null;
+  }>(
+    `SELECT body_hash, status, response_code, response_body
+     FROM idempotency_keys
+     WHERE user_id = $1 AND key = $2`,
+    [idempotency.userId.toString(), idempotency.key],
+  );
+  const row = result.rows[0];
+  if (!row || row.status !== "completed" || row.response_code === null || row.response_body === null) {
+    // The conflicting row was not a committed outcome by the time we read it.
+    // Re-execute from scratch (Case 2): a transient conflict with a key that
+    // ultimately did not persist a response must not poison the client's retry.
+    throw new IdempotencyConflict();
+  }
+  if (row.body_hash !== idempotency.bodyHash) {
+    throw new AppError(
+      "IDEMPOTENCY_BODY_MISMATCH",
+      "the Idempotency-Key was already used with a different request body",
+    );
+  }
+  return { code: row.response_code, body: row.response_body };
 }
 
 /**
@@ -141,18 +285,62 @@ async function lockAccountsAscending(
 }
 
 /**
- * Execute a transfer per design §9.1. Returns a result object the routes
- * serialize (money as strings). Fee applies to peer_transfer only (design
- * §9.1.2); top_up/withdrawal carry no fee.
+ * Upper bound on re-execution after a transient idempotency conflict (design
+ * §11.2 Case 2 / the x10-parallel case). Each re-execution happens only when a
+ * conflicting key did NOT persist a committed response (the winner rolled back),
+ * so progress is guaranteed; the bound is a safety net against a pathological
+ * churn, not expected to be reached in practice.
+ */
+const MAX_IDEMPOTENCY_ATTEMPTS = 50;
+
+/**
+ * Execute a transfer per design §9.1. When `ctx.idempotency` is set the key is
+ * inserted FIRST (step 3) and a same-key replay is detected SOLELY by the
+ * `UNIQUE(user_id, key)` violation (§11.2) — never by SELECTing an in_progress
+ * key. Returns a `TransferOutcome`: an `executed` fresh run (carrying the
+ * computed result and the persisted response) or a `replay` of the committed
+ * saved response, byte-for-byte, with no money moved. Fee applies to
+ * peer_transfer only (design §9.1.2); top_up/withdrawal carry no fee.
  */
 export async function executeTransfer(
   pool: Pool,
   ctx: TransferContext,
-): Promise<TransferResult> {
+): Promise<TransferOutcome> {
+  for (let attempt = 0; attempt < MAX_IDEMPOTENCY_ATTEMPTS; attempt++) {
+    try {
+      return await runTransferTxn(pool, ctx);
+    } catch (err) {
+      if (err instanceof IdempotencyConflict && ctx.idempotency) {
+        // The step-3 INSERT hit UNIQUE(user_id, key); the txn has rolled back
+        // (no money moved, no key persisted by THIS attempt). Resolve against
+        // the COMMITTED conflicting row on the pool. A completed row → replay
+        // (or 422 on body mismatch); a non-committed row (winner rolled back,
+        // its key vanished) → resolveReplay re-throws IdempotencyConflict so we
+        // loop and re-execute from scratch (Case 2).
+        const response = await resolveReplay(pool, ctx.idempotency);
+        return { kind: "replay", response };
+      }
+      throw err;
+    }
+  }
+  // Exhausted re-executions without ever committing or finding a completed row.
+  throw new AppError(
+    "INTERNAL",
+    "idempotency key conflict could not be resolved after repeated retries",
+  );
+}
+
+/** One attempt: the single §9.1 transfer transaction at READ COMMITTED. */
+async function runTransferTxn(
+  pool: Pool,
+  ctx: TransferContext,
+): Promise<TransferOutcome> {
   return withTransaction(
     pool,
-    async (client) => {
-      // --- STEP 3 (FEAT-004 seam): insert idempotency key first ---
+    async (client): Promise<TransferOutcome> => {
+      // --- STEP 3: insert idempotency key FIRST (design §9.1 step 3 / §11) ---
+      // On the UNIQUE(user_id,key) violation this throws IdempotencyConflict,
+      // aborting the txn before any money moves (replay handled post-rollback).
       if (ctx.idempotency) {
         await insertIdempotencyKeyFirst(client, ctx.idempotency);
       }
@@ -200,14 +388,15 @@ export async function executeTransfer(
           actor: ctx.actor,
         });
         // No ledger entries, no balance change on HELD (design §9.1.1).
-        return {
+        const result: TransferResult = {
           transfer_id: transferId.toString(),
-          status: "HELD" as const,
+          status: "HELD",
           type: ctx.type,
           amount: serializeAmount(ctx.amount),
           fee: serializeAmount(fee),
           wallet_balance: actingBalanceString(ctx, source, dest, 0n, 0n),
         };
+        return finishTransfer(client, ctx, result);
       }
 
       // --- STEP 7: insert the transfers row (COMPLETED) ---
@@ -243,21 +432,39 @@ export async function executeTransfer(
         actor: ctx.actor,
       });
 
-      // --- STEP 11 (FEAT-004 seam): mark idempotency key completed with saved
-      // response. No-op today (insertIdempotencyKeyFirst was a no-op). ---
-
+      // --- STEP 11: mark idempotency key completed with the saved response ---
       // --- STEP 12: COMMIT (handled by withTransaction) ---
-      return {
+      const result: TransferResult = {
         transfer_id: transferId.toString(),
-        status: "COMPLETED" as const,
+        status: "COMPLETED",
         type: ctx.type,
         amount: serializeAmount(ctx.amount),
         fee: serializeAmount(fee),
         wallet_balance: actingBalanceString(ctx, source, dest, outflow, ctx.amount),
       };
+      return finishTransfer(client, ctx, result);
     },
     { isolationLevel: "READ COMMITTED" },
   );
+}
+
+/**
+ * STEP 11 tail: build the route's response from the result, persist it on the
+ * key (when idempotent) so later replays return it byte-for-byte, and hand the
+ * `executed` outcome back. When there is no idempotency context the response is
+ * left to the route (returned undefined) and no key is written.
+ */
+async function finishTransfer(
+  client: PoolClient,
+  ctx: TransferContext,
+  result: TransferResult,
+): Promise<TransferOutcome> {
+  if (!ctx.idempotency) {
+    return { kind: "executed", result };
+  }
+  const response = ctx.idempotency.buildResponse(result);
+  await completeIdempotencyKey(client, ctx.idempotency, response);
+  return { kind: "executed", result, response };
 }
 
 async function insertTransfer(
