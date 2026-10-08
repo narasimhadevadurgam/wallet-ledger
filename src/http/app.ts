@@ -7,6 +7,7 @@ import { usersRouter } from "./routes/users.js";
 import { walletsRouter } from "./routes/wallets.js";
 import { transfersRouter } from "./routes/transfers.js";
 import { statementRouter } from "./routes/statement.js";
+import { adminRouter } from "./routes/admin.js";
 
 /**
  * Build the Express app. Middleware order matters:
@@ -18,6 +19,9 @@ import { statementRouter } from "./routes/statement.js";
  * The admin router (/admin/*) is mounted by FEAT-005. The statement-ask route
  * is added by FEAT-006. Those FEATs insert their routers before the error
  * middleware the same way these do.
+ *
+ * NOTE: statementRouter is mounted LAST among the resource routers but BEFORE
+ * the error middleware; the admin router is mounted alongside the others.
  */
 export function createApp(pool: Pool): Express {
   const app = express();
@@ -34,6 +38,7 @@ export function createApp(pool: Pool): Express {
   app.use(walletsRouter(pool));
   app.use(transfersRouter(pool));
   app.use(statementRouter(pool));
+  app.use(adminRouter(pool));
 
   app.use(errorMiddleware);
 
