@@ -3,10 +3,9 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import type { Pool } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
 import { createApp } from "../../src/http/app.js";
 import { MockLlmClient } from "../../src/llm/mockClient.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * Fraud acceptance tests (design §9.1 step 6, §9.1.1, §14; §12 AC-8/AC-9) —
@@ -30,7 +29,7 @@ describe.skipIf(SKIP_INTEGRATION)("fraud rules (AC-8, AC-9)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
     const app = createApp(pool, new MockLlmClient());
     await new Promise<void>((resolve) => {
       server = app.listen(0, resolve);
@@ -54,14 +53,20 @@ describe.skipIf(SKIP_INTEGRATION)("fraud rules (AC-8, AC-9)", () => {
   });
 
   it("AC-8: fundable over-max transfer is HELD and moves no money; release completes it", async () => {
-    // Lower single_over_max so a modest, fundable transfer trips it; keep
-    // velocity/rapid_drain out of the way for this case.
+    // Keep velocity/rapid_drain out of the way for this case.
     await pool.query(`UPDATE risk_rules SET enabled = false WHERE rule_name IN ('velocity','rapid_drain')`);
-    await pool.query(`UPDATE risk_rules SET threshold = 500, enabled = true WHERE rule_name = 'single_over_max'`);
+    // Ensure single_over_max is high while funding so the top-up is not held.
+    await pool.query(`UPDATE risk_rules SET threshold = 100000000, enabled = true WHERE rule_name = 'single_over_max'`);
 
     const sender = await freshWallet(baseUrl);
     const recipient = await freshWallet(baseUrl);
+    // Fund the sender BEFORE lowering single_over_max — the top-up itself is a
+    // transfer and would otherwise trip the lowered threshold and be HELD,
+    // leaving the sender unfunded.
     await topUp(baseUrl, sender, "5000");
+
+    // Now lower single_over_max so a modest, fundable transfer trips it.
+    await pool.query(`UPDATE risk_rules SET threshold = 500, enabled = true WHERE rule_name = 'single_over_max'`);
 
     // 1000 > 500 threshold, but the sender holds 5000 -> fundable -> HELD.
     const res = await postKeyed(`${baseUrl}/transfers`, {
@@ -97,12 +102,16 @@ describe.skipIf(SKIP_INTEGRATION)("fraud rules (AC-8, AC-9)", () => {
 
   it("AC-8 companion: draining the sender before release -> 422 and transfer left FAILED", async () => {
     await pool.query(`UPDATE risk_rules SET enabled = false WHERE rule_name IN ('velocity','rapid_drain')`);
-    await pool.query(`UPDATE risk_rules SET threshold = 500, enabled = true WHERE rule_name = 'single_over_max'`);
 
     const sender = await freshWallet(baseUrl);
     const recipient = await freshWallet(baseUrl);
     const sink = await freshWallet(baseUrl);
+    // Raise single_over_max to its high default first (a prior test may have
+    // lowered it) so the funding top-up is not itself held, then fund the
+    // sender, then lower the threshold for the over-max hold below.
+    await pool.query(`UPDATE risk_rules SET threshold = 100000000, enabled = true WHERE rule_name = 'single_over_max'`);
     await topUp(baseUrl, sender, "5000");
+    await pool.query(`UPDATE risk_rules SET threshold = 500, enabled = true WHERE rule_name = 'single_over_max'`);
 
     // Create a HELD over-max transfer (fundable at hold time).
     const res = await postKeyed(`${baseUrl}/transfers`, {
@@ -136,12 +145,20 @@ describe.skipIf(SKIP_INTEGRATION)("fraud rules (AC-8, AC-9)", () => {
     // Isolate: single_over_max/rapid_drain high/off; velocity LOW for this run.
     await pool.query(`UPDATE risk_rules SET threshold = 100000000, enabled = true WHERE rule_name = 'single_over_max'`);
     await pool.query(`UPDATE risk_rules SET enabled = false WHERE rule_name = 'rapid_drain'`);
-    // threshold=2 within 60s: the 3rd transfer in the window trips (prior count 2 +1 > 2).
-    await pool.query(`UPDATE risk_rules SET threshold = 2, window_seconds = 60, enabled = true WHERE rule_name = 'velocity'`);
+    // Keep velocity DISABLED while funding: the top-up's source is the shared
+    // cash_in system account, which many prior top-ups also sourced within the
+    // 60s window — an enabled low-threshold velocity rule would otherwise count
+    // those and HOLD the funding top-up, leaving the sender unfunded.
+    await pool.query(`UPDATE risk_rules SET enabled = false WHERE rule_name = 'velocity'`);
 
     const sender = await freshWallet(baseUrl);
     const recipient = await freshWallet(baseUrl);
     await topUp(baseUrl, sender, "10000");
+
+    // Now enable velocity LOW for the burst below. threshold=2 within 60s: the
+    // 3rd transfer FROM the (fresh) sender wallet trips (prior count 2 +1 > 2).
+    // The sender is brand new, so only its own three peer transfers count.
+    await pool.query(`UPDATE risk_rules SET threshold = 2, window_seconds = 60, enabled = true WHERE rule_name = 'velocity'`);
 
     const statuses: string[] = [];
     const ids: string[] = [];

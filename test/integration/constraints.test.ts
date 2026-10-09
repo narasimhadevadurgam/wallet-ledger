@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * AC-13: the non-negative balance constraint.
@@ -18,7 +17,7 @@ describe.skipIf(SKIP_INTEGRATION)("balance constraints (AC-13)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
   });
 
   afterAll(async () => {

@@ -62,7 +62,14 @@ export function adminRouter(pool: Pool): Router {
   router.post("/admin/transfers/:id/release", async (req, res, next) => {
     try {
       const { id } = parseOrThrow(idParamSchema, req.params);
-      const result = await releaseTransfer(pool, id, "admin");
+      const outcome = await releaseTransfer(pool, id, "admin");
+      // An underfunded release committed the HELD->FAILED transition (design
+      // §9.1.1); surface it as 422 AFTER that commit, so the transfer stays
+      // permanently FAILED rather than being rolled back to HELD.
+      if (outcome.kind === "insufficient") {
+        throw new AppError("INSUFFICIENT_FUNDS", outcome.message);
+      }
+      const result = outcome.result;
       res.status(200).json({
         transfer_id: result.transfer_id,
         status: result.status,

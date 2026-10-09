@@ -3,10 +3,9 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import type { Pool } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
 import { createApp } from "../../src/http/app.js";
 import { MockLlmClient } from "../../src/llm/mockClient.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * AC-10 — prompt injection does not widen scope (design §10 guardrails, §10.1,
@@ -33,7 +32,7 @@ describe.skipIf(SKIP_INTEGRATION)("prompt injection (AC-10)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
     await pool.query(`UPDATE risk_rules SET enabled = false WHERE rule_name IN ('velocity','rapid_drain')`);
     await pool.query(`UPDATE risk_rules SET threshold = 100000000, enabled = true WHERE rule_name = 'single_over_max'`);
     const app = createApp(pool, new MockLlmClient());

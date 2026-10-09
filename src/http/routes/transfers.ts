@@ -51,13 +51,18 @@ export function transfersRouter(pool: Pool): Router {
           bodyHash: req.idempotency!.bodyHash,
           buildResponse: (result) => ({
             code: 201,
-            body: transferBody(result, requestId),
+            body: JSON.stringify(transferBody(result, requestId)),
           }),
         },
       });
 
       if (outcome.response) {
-        res.status(outcome.response.code).json(outcome.response.body);
+        // Send the EXACT stored bytes (built on execute, read verbatim on a
+        // replay) so a replay is byte-identical to the first response (§11.2).
+        res
+          .status(outcome.response.code)
+          .type("application/json")
+          .send(outcome.response.body);
       } else if (outcome.kind === "executed") {
         res.status(201).json(transferBody(outcome.result, requestId));
       }

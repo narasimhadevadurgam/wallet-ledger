@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * AC-12: the ledger is insert-only and per-transfer debits == credits is
@@ -36,7 +35,7 @@ describe.skipIf(SKIP_INTEGRATION)("ledger immutability (AC-12)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
     accounts = await systemAccountIds(pool);
   });
 

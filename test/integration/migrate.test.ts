@@ -7,9 +7,10 @@ import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
  * AC-15: migrate from an EMPTY database builds the full schema with zero errors,
  * and a second run is a no-op.
  *
- * This test assumes DATABASE_URL points at a database it is free to migrate
- * (CI uses a throwaway Postgres service). It does not drop anything; it relies
- * on the runner being idempotent, which is exactly what it asserts.
+ * The suites share one Postgres and run serially (see vitest.config.ts), so we
+ * first reset `public` to empty here and then migrate from scratch — exactly
+ * the "from an empty database" the AC describes — and the final test re-runs
+ * the runner to assert it is a no-op (idempotent).
  */
 
 const EXPECTED_TABLES = [
@@ -38,6 +39,10 @@ describe.skipIf(SKIP_INTEGRATION)("migrations (AC-15)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
+    // Start from a genuinely empty schema so this suite exercises a full
+    // migrate-from-empty, then asserts the second run is a no-op.
+    await pool.query("DROP SCHEMA public CASCADE");
+    await pool.query("CREATE SCHEMA public");
     await runMigrations(pool);
   });
 

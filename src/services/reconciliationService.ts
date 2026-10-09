@@ -267,6 +267,11 @@ async function checkPerTransferBalance(client: PoolClient): Promise<Problem[]> {
  * expected = stored, actual = computed). A LEFT JOIN covers accounts with zero
  * entries (computed 0); system accounts are included — at baseline they are
  * seeded 0/0 so they never raise a false positive (design §13 finding 2a).
+ *
+ * Each side's SUM is wrapped in COALESCE(...,0) BEFORE subtracting: an account
+ * with entries on only ONE side (e.g. a system cash_in with only debits) has a
+ * NULL SUM on the empty side, and `NULL - x` is NULL, which would otherwise
+ * collapse the computed balance to 0 and misreport (or hide) a real drift.
  */
 async function checkStoredVsComputed(client: PoolClient): Promise<Problem[]> {
   const result = await client.query<{
@@ -277,17 +282,14 @@ async function checkStoredVsComputed(client: PoolClient): Promise<Problem[]> {
     `SELECT
        a.id::text AS account_id,
        a.balance::text AS stored,
-       COALESCE(
-         SUM(le.amount) FILTER (WHERE le.direction = 'credit')
-       - SUM(le.amount) FILTER (WHERE le.direction = 'debit'),
-       0)::text AS computed
+       (COALESCE(SUM(le.amount) FILTER (WHERE le.direction = 'credit'), 0)
+      - COALESCE(SUM(le.amount) FILTER (WHERE le.direction = 'debit'),  0))::text AS computed
      FROM accounts a
      LEFT JOIN ledger_entries le ON le.account_id = a.id
      GROUP BY a.id, a.balance
-     HAVING a.balance <> COALESCE(
-         SUM(le.amount) FILTER (WHERE le.direction = 'credit')
-       - SUM(le.amount) FILTER (WHERE le.direction = 'debit'),
-       0)
+     HAVING a.balance <>
+         COALESCE(SUM(le.amount) FILTER (WHERE le.direction = 'credit'), 0)
+       - COALESCE(SUM(le.amount) FILTER (WHERE le.direction = 'debit'),  0)
      ORDER BY a.id`,
   );
   return result.rows.map((row) => ({
@@ -308,18 +310,15 @@ async function checkNegativeBalance(client: PoolClient): Promise<Problem[]> {
   const result = await client.query<{ account_id: string; computed: string }>(
     `SELECT
        a.id::text AS account_id,
-       COALESCE(
-         SUM(le.amount) FILTER (WHERE le.direction = 'credit')
-       - SUM(le.amount) FILTER (WHERE le.direction = 'debit'),
-       0)::text AS computed
+       (COALESCE(SUM(le.amount) FILTER (WHERE le.direction = 'credit'), 0)
+      - COALESCE(SUM(le.amount) FILTER (WHERE le.direction = 'debit'),  0))::text AS computed
      FROM accounts a
      LEFT JOIN ledger_entries le ON le.account_id = a.id
      WHERE a.is_system = false
      GROUP BY a.id
-     HAVING COALESCE(
-         SUM(le.amount) FILTER (WHERE le.direction = 'credit')
-       - SUM(le.amount) FILTER (WHERE le.direction = 'debit'),
-       0) < 0
+     HAVING
+         COALESCE(SUM(le.amount) FILTER (WHERE le.direction = 'credit'), 0)
+       - COALESCE(SUM(le.amount) FILTER (WHERE le.direction = 'debit'),  0) < 0
      ORDER BY a.id`,
   );
   return result.rows.map((row) => ({

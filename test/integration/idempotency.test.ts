@@ -3,10 +3,9 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import type { Pool } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
 import { createApp } from "../../src/http/app.js";
 import { MockLlmClient } from "../../src/llm/mockClient.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * Idempotency acceptance tests (design §11, §12 AC-2..AC-5) — against a REAL
@@ -33,7 +32,7 @@ describe.skipIf(SKIP_INTEGRATION)("idempotency (AC-2..AC-5, §11.3)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
     const app = createApp(pool, new MockLlmClient());
     await new Promise<void>((resolve) => {
       server = app.listen(0, resolve);

@@ -3,10 +3,9 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import type { Pool } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
 import { createApp } from "../../src/http/app.js";
 import { MockLlmClient } from "../../src/llm/mockClient.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * AC-1 — the stampede / concurrency acceptance test (design §12, §15).
@@ -43,7 +42,7 @@ describe.skipIf(SKIP_INTEGRATION)("stampede: 100 concurrent withdrawals (AC-1)",
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
 
     // Disable the fraud rules that could hold a withdrawal.
     const current = await pool.query<{ rule_name: string; enabled: boolean }>(

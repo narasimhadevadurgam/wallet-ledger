@@ -3,10 +3,9 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import type { Pool } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
 import { createApp } from "../../src/http/app.js";
 import { MockLlmClient, ASK_FIXTURE } from "../../src/llm/mockClient.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * AC-11 — statement-ask correctness (design §10.1, FR-14) against a REAL
@@ -45,7 +44,7 @@ describe.skipIf(SKIP_INTEGRATION)("statement ask (AC-11)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
     // Keep fraud rules out of the way: these are ordinary funded transfers.
     await pool.query(`UPDATE risk_rules SET enabled = false WHERE rule_name IN ('velocity','rapid_drain')`);
     await pool.query(`UPDATE risk_rules SET threshold = 100000000, enabled = true WHERE rule_name = 'single_over_max'`);

@@ -1,11 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Pool } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
 import {
   getStatementCursor,
   getStatementOffset,
 } from "../../src/services/statementService.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * AC-14 — statement pagination (design §8). Seed several transfers for one
@@ -27,7 +26,7 @@ describe.skipIf(SKIP_INTEGRATION)("statement pagination (AC-14)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
 
     const suffix = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
     const user = await pool.query<{ id: string }>(

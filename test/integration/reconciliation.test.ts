@@ -2,11 +2,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import type { Pool, PoolClient } from "pg";
-import { runMigrations } from "../../src/db/migrateRunner.js";
 import { createApp } from "../../src/http/app.js";
 import { MockLlmClient } from "../../src/llm/mockClient.js";
 import { run as runReconciliation } from "../../src/services/reconciliationService.js";
-import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
+import { SKIP_INTEGRATION, createTestPool, resetSchema } from "./helpers.js";
 
 /**
  * Reconciliation acceptance tests (design §13, §12 AC-6/AC-7) — against a REAL
@@ -50,7 +49,7 @@ describe.skipIf(SKIP_INTEGRATION)("reconciliation (AC-6, AC-7)", () => {
 
   beforeAll(async () => {
     pool = createTestPool();
-    await runMigrations(pool);
+    await resetSchema(pool);
     const app = createApp(pool, new MockLlmClient());
     await new Promise<void>((resolve) => {
       server = app.listen(0, resolve);
@@ -76,13 +75,24 @@ describe.skipIf(SKIP_INTEGRATION)("reconciliation (AC-6, AC-7)", () => {
     expect(baseline.problemCount).toBe(0);
 
     // Corruption 1: global_balance + per_transfer_balance on transfer tA.
+    // Add ONE extra `debit` entry on tA's source wallet so tA's debits exceed
+    // its credits. This is a deliberate ledger corruption that bypasses the
+    // app, so we disable the DEFERRABLE balanced-transfer trigger (0014) for
+    // just this write — exactly the kind of out-of-band damage reconciliation
+    // exists to detect.
     const tA = seed.transfers[0]!;
     const delta = tA.amount;
-    await pool.query(
-      `INSERT INTO ledger_entries (transfer_id, account_id, direction, amount)
-       VALUES ($1, $2, 'debit', $3)`,
-      [tA.transferId, tA.fromAccountId, delta.toString()],
-    );
+
+    // The ring seed leaves every wallet with a net stored balance of 0, so the
+    // stored-balance reduction below (which keeps stored_vs_computed quiet for
+    // tA's source) would otherwise drive a user wallet negative and trip the
+    // non-negative CHECK. Fund tA's source by `delta` first with a REAL balanced
+    // top-up so stored and computed both rise together; the later reduction then
+    // lands at exactly 0. tA's source already has both credit and debit entries,
+    // so it stays two-sided and reconciliation computes its balance correctly.
+    await fundAccount(pool, tA.fromAccountId, delta);
+
+    await injectUnbalancedDebit(pool, tA.transferId, tA.fromAccountId, delta);
     // Keep tA's source stored balance consistent with its new computed value so
     // stored_vs_computed does NOT fire for that account.
     await pool.query(`UPDATE accounts SET balance = balance - $2 WHERE id = $1`, [
@@ -161,6 +171,84 @@ describe.skipIf(SKIP_INTEGRATION)("reconciliation (AC-6, AC-7)", () => {
     }
   });
 });
+
+// --- Corruption injection ---------------------------------------------------
+
+/**
+ * Insert a single extra `debit` ledger entry for `transferId`, deliberately
+ * leaving the transfer unbalanced. The DEFERRABLE balanced-transfer trigger
+ * (0014) is disabled for just this write and re-enabled immediately after, so
+ * the unbalanced commit is allowed — this simulates ledger corruption that
+ * happened OUT of the application path, which is precisely what reconciliation
+ * exists to detect. The owning test role can toggle its own table's trigger;
+ * the trigger is restored before any later statement runs.
+ */
+async function injectUnbalancedDebit(
+  pool: Pool,
+  transferId: string,
+  accountId: string,
+  amount: bigint,
+): Promise<void> {
+  await pool.query(
+    `ALTER TABLE ledger_entries DISABLE TRIGGER ledger_entries_balanced`,
+  );
+  try {
+    await pool.query(
+      `INSERT INTO ledger_entries (transfer_id, account_id, direction, amount)
+       VALUES ($1, $2, 'debit', $3)`,
+      [transferId, accountId, amount.toString()],
+    );
+  } finally {
+    await pool.query(
+      `ALTER TABLE ledger_entries ENABLE TRIGGER ledger_entries_balanced`,
+    );
+  }
+}
+
+/**
+ * Fund `accountId` by `amount` via a REAL balanced top-up (cash_in -> account):
+ * a COMPLETED top_up transfer with a balanced debit/credit pair plus the two
+ * stored-balance updates. The entries are balanced and the stored balances
+ * track the ledger, so reconciliation stays clean (stored == computed for both
+ * accounts, debits == credits globally). Used to give a ring wallet positive
+ * headroom before a corruption that reduces its stored balance.
+ */
+async function fundAccount(pool: Pool, accountId: string, amount: bigint): Promise<void> {
+  const cashInId = (
+    await pool.query<{ id: string }>(
+      `SELECT id FROM accounts WHERE is_system = true AND system_type = 'cash_in'`,
+    )
+  ).rows[0]!.id;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const transfer = await client.query<{ id: string }>(
+      `INSERT INTO transfers (type, status, amount, from_account_id, to_account_id)
+       VALUES ('top_up', 'COMPLETED', $1, $2, $3) RETURNING id`,
+      [amount.toString(), cashInId, accountId],
+    );
+    const transferId = transfer.rows[0]!.id;
+    await client.query(
+      `INSERT INTO ledger_entries (transfer_id, account_id, direction, amount) VALUES
+         ($1, $2, 'debit', $3), ($1, $4, 'credit', $3)`,
+      [transferId, cashInId, amount.toString(), accountId],
+    );
+    await client.query(`UPDATE accounts SET balance = balance + $2 WHERE id = $1`, [
+      accountId,
+      amount.toString(),
+    ]);
+    await client.query(`UPDATE accounts SET balance = balance - $2 WHERE id = $1`, [
+      cashInId,
+      amount.toString(),
+    ]);
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 // --- Seeding ----------------------------------------------------------------
 

@@ -36,14 +36,15 @@ export type TransferType = "top_up" | "peer_transfer" | "withdrawal";
 
 /**
  * The HTTP response a money route would send for a freshly-executed transfer:
- * the status code and the exact JSON body. This is what gets persisted on the
- * idempotency key at step 11 and replayed byte-for-byte on a later same-key
- * request (design §11.2). `body` is a plain JSON-serializable object (money as
- * strings already).
+ * the status code and the EXACT serialized JSON body string. This is what gets
+ * persisted on the idempotency key at step 11 and replayed byte-for-byte on a
+ * later same-key request (design §11.2). `body` is the already-serialized JSON
+ * text (money as strings already); storing and replaying the exact bytes keeps
+ * a replay byte-identical to the first response regardless of key order.
  */
 export interface TransferResponse {
   code: number;
-  body: Record<string, unknown>;
+  body: string;
 }
 
 /**
@@ -176,7 +177,8 @@ async function completeIdempotencyKey(
       idempotency.key,
       idempotency.bodyHash,
       response.code,
-      JSON.stringify(response.body),
+      // Store the EXACT serialized bytes so a replay returns them verbatim.
+      response.body,
     ],
   );
 }
@@ -202,7 +204,7 @@ async function resolveReplay(
     body_hash: string;
     status: string;
     response_code: number | null;
-    response_body: Record<string, unknown> | null;
+    response_body: string | null;
   }>(
     `SELECT body_hash, status, response_code, response_body
      FROM idempotency_keys
@@ -482,6 +484,19 @@ export interface ReleaseResult {
 }
 
 /**
+ * What `releaseTransfer` hands back to the admin route (design §9.1.1). A
+ * `completed` outcome carries the money-moved result (200). An `insufficient`
+ * outcome means the sender was underfunded at release time: the transfer was
+ * transitioned HELD->FAILED and that transition COMMITTED (the only FAILED
+ * terminal state), and the route maps this to `422 INSUFFICIENT_FUNDS`. We must
+ * COMMIT the FAILED status rather than throw inside the transaction (which would
+ * roll the transition back and leave the transfer stuck HELD).
+ */
+export type ReleaseOutcome =
+  | { kind: "completed"; result: ReleaseResult }
+  | { kind: "insufficient"; message: string };
+
+/**
  * Release a HELD transfer (design §9.1.1, FR-12). ONE transaction at READ
  * COMMITTED that:
  *   1. locks the HELD transfer row AND both its accounts FOR UPDATE, ascending
@@ -489,11 +504,18 @@ export interface ReleaseResult {
  *   2. 409 TRANSFER_NOT_HELD if the transfer is not currently HELD (covers the
  *      not-found, already-released, and second-call cases);
  *   3. re-reads balances under lock and re-checks funds (balance >= amount +
- *      fee). If insufficient, transitions HELD->FAILED, audits, and throws
- *      422 INSUFFICIENT_FUNDS (the transfer stays FAILED — the only FAILED path);
+ *      fee). If insufficient, transitions HELD->FAILED, audits, and COMMITS
+ *      that transition, returning an `insufficient` outcome the route maps to
+ *      422 INSUFFICIENT_FUNDS (the transfer stays FAILED — the only FAILED
+ *      path). The FAILED status must commit, so we return a discriminated
+ *      outcome rather than throwing inside the txn (a throw would roll the
+ *      transition back and leave the transfer stuck HELD);
  *   4. otherwise inserts the balanced ledger entries, updates stored balances
  *      (exactly as the money path steps 8-9), transitions HELD->COMPLETED,
  *      audits, and commits.
+ *
+ * No ledger entries and no balance changes happen on the FAILED path, so the
+ * HELD/FAILED no-balance-movement invariant holds (design §9.1.1 finding 2b).
  *
  * Idempotency-exempt: a second call sees a non-HELD row and 409s.
  */
@@ -501,10 +523,10 @@ export async function releaseTransfer(
   pool: Pool,
   transferId: bigint,
   actor: string,
-): Promise<ReleaseResult> {
+): Promise<ReleaseOutcome> {
   return withTransaction(
     pool,
-    async (client): Promise<ReleaseResult> => {
+    async (client): Promise<ReleaseOutcome> => {
       // --- 1a: lock the transfer row FOR UPDATE ---
       const txResult = await client.query<HeldTransferRow>(
         `SELECT id, type, status, amount, from_account_id, to_account_id
@@ -537,6 +559,11 @@ export async function releaseTransfer(
       const outflow = amount + fee;
 
       // --- 3: re-check funds under lock; insufficient -> HELD->FAILED + 422 ---
+      // The FAILED transition + audit must COMMIT (it is the only FAILED
+      // terminal state), so we return an `insufficient` outcome and let
+      // withTransaction COMMIT normally — throwing here would roll the FAILED
+      // write back and leave the transfer stuck HELD. No ledger entries / no
+      // balance change happen on this path.
       const sourceBalance = BigInt(source.balance);
       if (!source.is_system && sourceBalance < outflow) {
         await client.query(
@@ -549,10 +576,10 @@ export async function releaseTransfer(
           newStatus: "FAILED",
           actor,
         });
-        throw new AppError(
-          "INSUFFICIENT_FUNDS",
-          `insufficient funds to release transfer ${transferId}: balance ${source.balance} < required ${outflow.toString()}`,
-        );
+        return {
+          kind: "insufficient",
+          message: `insufficient funds to release transfer ${transferId}: balance ${source.balance} < required ${outflow.toString()}`,
+        };
       }
 
       // --- 4: balanced ledger entries + stored balances (as money path 8-9) ---
@@ -584,12 +611,15 @@ export async function releaseTransfer(
       });
 
       return {
-        transfer_id: transferId.toString(),
-        status: "COMPLETED",
-        type: transfer.type,
-        amount: serializeAmount(amount),
-        fee: serializeAmount(fee),
-        wallet_balance: (sourceBalance - outflow).toString(),
+        kind: "completed",
+        result: {
+          transfer_id: transferId.toString(),
+          status: "COMPLETED",
+          type: transfer.type,
+          amount: serializeAmount(amount),
+          fee: serializeAmount(fee),
+          wallet_balance: (sourceBalance - outflow).toString(),
+        },
       };
     },
     { isolationLevel: "READ COMMITTED" },
