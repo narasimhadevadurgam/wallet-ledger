@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
 import type { Pool } from "pg";
@@ -15,8 +16,9 @@ import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
  *   - DISABLE the velocity and rapid_drain rules for the run (so fraud never
  *     holds a withdrawal and the test measures ONLY the locking/funds path);
  *   - fire 100 concurrent 1000-paise withdrawals via Promise.all, each with a
- *     distinct Idempotency-Key header (keys are harmless today; FEAT-004 makes
- *     the header required — see the findings note);
+ *     distinct, valid-UUID Idempotency-Key header (the money POSTs require a
+ *     UUID key per FEAT-004; 100 distinct keys per iteration keep every attempt
+ *     a fresh request so exactly 50 win on funds, not on replay);
  *   - assert EXACTLY 50 succeed (201), the wallet ends at exactly 0, no read
  *     ever observed a negative balance, and the GLOBAL ledger stays balanced
  *     (SUM(debit) == SUM(credit)).
@@ -80,8 +82,8 @@ describe.skipIf(SKIP_INTEGRATION)("stampede: 100 concurrent withdrawals (AC-1)",
     for (let iter = 0; iter < ITERATIONS; iter++) {
       const walletId = await createFundedWallet(pool, START_BALANCE, iter);
 
-      const attempts = Array.from({ length: CONCURRENCY }, (_, i) =>
-        withdraw(baseUrl, walletId, WITHDRAW_PAISE, `${iter}-${i}`),
+      const attempts = Array.from({ length: CONCURRENCY }, () =>
+        withdraw(baseUrl, walletId, WITHDRAW_PAISE, randomUUID()),
       );
       const results = await Promise.all(attempts);
 
@@ -179,7 +181,7 @@ async function withdraw(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Idempotency-Key": `stampede-${key}`,
+      "Idempotency-Key": key,
     },
     body: JSON.stringify({ amount }),
   });

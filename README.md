@@ -44,6 +44,23 @@ npm run test               # full suite; integration tests need DATABASE_URL at 
 Integration tests skip automatically when `DATABASE_URL` is unset (see `test/integration/helpers.ts`),
 so the unit suite runs anywhere.
 
+### Verification status
+
+Honest record of what was actually executed while building this repo:
+
+- **Ran and passing locally:** `npx tsc --noEmit` (typecheck, zero diagnostics) and the unit suite
+  (`npx vitest run test/unit`).
+- **Authored but NOT run here:** every Postgres-backed integration/acceptance test under
+  `test/integration/` — including the four headline acceptance tests (AC-1 stampede, AC-2..AC-5
+  idempotency, AC-6 reconciliation, AC-10 prompt-injection) and the rest of AC-1..AC-17. This build
+  environment has no Docker and no Postgres (`docker`/`psql` are not on `PATH`), so these tests
+  `describe.skipIf(SKIP_INTEGRATION)` out when `DATABASE_URL` is unset. They are typecheck-clean but
+  have not been executed against a real database in this environment. **No Postgres-backed pass is
+  claimed here.**
+- **Where they do run:** `.github/workflows/ci.yml` provisions a `postgres:15` service, applies the
+  migrations, and runs the full `npx vitest run` suite (with `LLM_PROVIDER=mock`). CI is the place the
+  integration/acceptance tests actually execute end to end.
+
 ### Switching the LLM from mock to Ollama
 
 The LLM provider is chosen by `LLM_PROVIDER` (default `mock`). The mock is deterministic, offline, and
