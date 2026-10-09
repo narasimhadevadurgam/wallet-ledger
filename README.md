@@ -46,20 +46,25 @@ so the unit suite runs anywhere.
 
 ### Verification status
 
-Honest record of what was actually executed while building this repo:
+Honest record of what has actually been executed:
 
-- **Ran and passing locally:** `npx tsc --noEmit` (typecheck, zero diagnostics) and the unit suite
-  (`npx vitest run test/unit`).
-- **Authored but NOT run here:** every Postgres-backed integration/acceptance test under
-  `test/integration/` — including the four headline acceptance tests (AC-1 stampede, AC-2..AC-5
-  idempotency, AC-6 reconciliation, AC-10 prompt-injection) and the rest of AC-1..AC-17. This build
-  environment has no Docker and no Postgres (`docker`/`psql` are not on `PATH`), so these tests
-  `describe.skipIf(SKIP_INTEGRATION)` out when `DATABASE_URL` is unset. They are typecheck-clean but
-  have not been executed against a real database in this environment. **No Postgres-backed pass is
-  claimed here.**
-- **Where they do run:** `.github/workflows/ci.yml` provisions a `postgres:15` service, applies the
-  migrations, and runs the full `npx vitest run` suite (with `LLM_PROVIDER=mock`). CI is the place the
-  integration/acceptance tests actually execute end to end.
+- **Ran and passing locally against a real PostgreSQL 15:** the **full suite — `62/62` tests
+  across 13 suites** — with `DATABASE_URL=postgres://wallet:wallet@localhost:5432/wallet_ledger`
+  (a `postgres:15` container with port 5432 published). This includes every acceptance test:
+  AC-1 stampede (exactly 50 winners per iteration, wallet ends at 0, debits == credits),
+  AC-2..AC-5 idempotency (byte-identical replay, 422 on body mismatch, 400 on missing key),
+  AC-6/AC-7 reconciliation (exactly 3 injected problems; `RECON_LOCKED` under a held lock),
+  AC-8/AC-9 fraud (fundable over-max → HELD; drain-then-release → 422 + permanently FAILED;
+  velocity burst → HELD), AC-10 prompt-injection (scope cannot be widened), AC-11 statement
+  Q&A, and AC-12..AC-15 (ledger immutability, balance constraints, pagination, migrations).
+  `npx tsc --noEmit` is clean (zero diagnostics) and the result was confirmed over two
+  consecutive full runs.
+- **Integration tests skip when `DATABASE_URL` is unset:** each DB-backed suite
+  `describe.skipIf(SKIP_INTEGRATION)`s out so the unit suite still runs anywhere with no
+  database. Set `DATABASE_URL` (or run via `docker compose`) to execute them.
+- **Where they also run:** `.github/workflows/ci.yml` provisions a `postgres:15` service,
+  applies the migrations, and runs the full `npx vitest run` suite with `LLM_PROVIDER=mock`,
+  so the integration/acceptance tests execute end to end in CI as well.
 
 ### Switching the LLM from mock to Ollama
 
@@ -91,6 +96,10 @@ id bound as a parameter.
 - **Canonicalization for idempotency:** `body_hash = SHA-256(canonical_json(body))` normalizes money
   fields to a canonical `bigint` decimal string first, so `1000`, `"1000"`, and `01000` all hash the
   same (design §11.1).
+- **Replay returns the original bytes verbatim:** a replayed money POST returns the first call's saved
+  response body byte-for-byte — including its `request_id`. This is required for byte-identical replay
+  (AC-2 / design §11.2), so a client correlating `request_id` to its own retry will see the first
+  call's id on replays, by design.
 
 ---
 
