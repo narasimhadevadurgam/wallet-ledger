@@ -116,6 +116,12 @@ async function ruleFires(
     case "rapid_drain": {
       // Sum outflow (debits on the source account) within the window; this
       // transfer adds `amount`. Fires when the running total exceeds threshold.
+      // Intentional asymmetry vs. `velocity`: velocity counts `transfers` rows
+      // (which includes HELD transfers that moved no money), while rapid_drain
+      // sums only *settled* debits in `ledger_entries` (a HELD transfer writes
+      // none). So a held-then-released drain contributes to this window at
+      // release time, not at hold time. This is deliberate: rapid_drain measures
+      // money that actually left, velocity measures attempt rate.
       const windowSeconds = rule.window_seconds ?? 60;
       const result = await client.query<{ s: string }>(
         `SELECT COALESCE(SUM(amount), 0)::text AS s

@@ -29,3 +29,11 @@ CREATE INDEX audit_log_transfer_idx
 
 CREATE INDEX reconciliation_problems_run_idx
     ON reconciliation_problems (run_id);
+
+-- Enforce "exactly one system account per system_type" at the DB level, so
+-- getSystemAccount('cash_in'|'cash_out'|'fee_revenue') can never match two rows.
+-- Partial unique index: applies only to system accounts (user wallets have
+-- system_type NULL and are unaffected). Also lets the 0015 seed use ON CONFLICT.
+CREATE UNIQUE INDEX accounts_system_type_uidx
+    ON accounts (system_type)
+    WHERE is_system;

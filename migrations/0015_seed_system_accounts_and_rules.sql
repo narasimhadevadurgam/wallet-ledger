@@ -13,11 +13,14 @@
 --   * the job_locks row for 'reconciliation'.
 -- Idempotent via ON CONFLICT so a re-run against an already-seeded DB is a no-op.
 
+-- ON CONFLICT on the partial unique index accounts_system_type_uidx (0012) makes
+-- this insert a true no-op on re-run, matching risk_rules/config/job_locks below.
 INSERT INTO accounts (user_id, is_system, system_type, currency, balance)
 VALUES
     (NULL, true, 'cash_in',     'INR', 0),
     (NULL, true, 'cash_out',    'INR', 0),
-    (NULL, true, 'fee_revenue', 'INR', 0);
+    (NULL, true, 'fee_revenue', 'INR', 0)
+ON CONFLICT (system_type) WHERE is_system DO NOTHING;
 
 INSERT INTO risk_rules (rule_name, threshold, window_seconds, action, enabled)
 VALUES
