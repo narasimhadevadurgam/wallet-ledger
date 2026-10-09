@@ -1,0 +1,72 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": 1,
+      "severity": "HIGH",
+      "title": "Fee is modeled both as extra ledger entries inside the peer transfer (design §9.1 step 8) and as a separate 'fee'-type transfer (schema §1 and transfers.type enum); the two models conflict and the fee-type transfer has no defined flow",
+      "location": "design.md §9.1 step 8, §9.1.2; schema.md §1, §8, transfers.type enum"
+    },
+    {
+      "id": 2,
+      "severity": "HIGH",
+      "title": "Reconciliation check (c) stored-vs-computed balance depends on unpinned system-account seed balances/opening entries; if nonzero or mismatched it reports false positives and breaks AC-6's 'exactly 3 problems'. Also the HELD->FAILED release path is silent on balances.",
+      "location": "design.md §13 check (c), §9.1 step 6, §9.1.1; schema.md §2, §8 (migration 0014 seed)"
+    },
+    {
+      "id": 3,
+      "severity": "MEDIUM",
+      "title": "Top-up and withdraw require an Idempotency-Key and insert idempotency_keys.user_id (non-null FK), but their bodies carry no user id and the path-wallet->owning-user mapping that scopes the key is unspecified",
+      "location": "design.md §9.1 step 3, §8 API table, §11; schema.md idempotency_keys.user_id"
+    },
+    {
+      "id": 4,
+      "severity": "MEDIUM",
+      "title": "Insert-first idempotency relies on blocking at the UNIQUE INSERT only; the design references 'replaying an in_progress key' (§17) without stating the negative invariant that no code path SELECTs an in_progress row to decide a replay",
+      "location": "design.md §9.1 steps 3/11, §11.2, §17 edge cases"
+    },
+    {
+      "id": 5,
+      "severity": "MEDIUM",
+      "title": "Reconciliation is specified at REPEATABLE READ but never states it tolerates concurrent live transfers (check (c) correctness under concurrent commits); AC-6 only tests a quiescent DB, leaving an undocumented operational constraint",
+      "location": "design.md §13, §9.2, §12 AC-6"
+    },
+    {
+      "id": 6,
+      "severity": "MEDIUM",
+      "title": "Naming drift between from_account_id/to_account_id (schema) and from_wallet_id/to_wallet_id (API body and a design §14 index) with no stated wallet-id->account-id mapping; both FK columns are nullable with no flow that produces NULL",
+      "location": "schema.md §2, §6; design.md §8 body, §14 index name"
+    },
+    {
+      "id": 7,
+      "severity": "MEDIUM",
+      "title": "Deferred per-transfer balance CONSTRAINT TRIGGER (§9.1.3) is described as evaluating 'once per transfer touched', but a Postgres constraint trigger fires FOR EACH ROW; the stated granularity is imprecise and could lead to a non-working implementation choice",
+      "location": "design.md §9.1.3; schema.md §6"
+    },
+    {
+      "id": 8,
+      "severity": "MEDIUM",
+      "title": "AC-1 stampede (100 rapid withdrawals from one wallet) assumes 'exactly 50 succeed' but the pinned seed enables velocity (hold) and rapid_drain (flag) rules which such a burst would trip; AC-1 and AC-9 share one seed with conflicting fraud expectations and no pinned thresholds",
+      "location": "design.md §12 AC-1, §12 AC-9, §14 Part A, §9.1 step 6"
+    },
+    {
+      "id": 9,
+      "severity": "NIT",
+      "title": "Reconciliation should state that the job_locks SELECT ... FOR UPDATE NOWAIT is the first statement in the REPEATABLE READ transaction so a losing contender fails fast before opening a snapshot",
+      "location": "design.md §13, §9.2"
+    },
+    {
+      "id": 10,
+      "severity": "NIT",
+      "title": "idempotency_keys.body_hash typed as 'BYTEA/CHAR(64)' either/or in schema §2 while §11.1 pins CHAR(64) lowercase hex; pick one to avoid a migration mismatch",
+      "location": "schema.md §2; design.md §11.1"
+    },
+    {
+      "id": 11,
+      "severity": "NIT",
+      "title": "Fee amount is said to live 'in config/risk_rules' but risk_rules has no fee column and 'fee' is not a valid action (hold|flag); where the fee amount is stored is under-specified for migration 0014",
+      "location": "design.md §9.1.2, §19; schema.md §1, §2, §8"
+    }
+  ],
+  "reviewDoc": "c:\\Users\\Narasimha.Devadurgam\\source\\repos\\wallet-ledger\\.agents\\tasks\\design-review.md"
+}

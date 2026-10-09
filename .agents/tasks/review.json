@@ -1,0 +1,41 @@
+{
+  "verdict": "APPROVED",
+  "findings": [
+    {
+      "severity": "info",
+      "detail": "Money path (src/services/transferService.ts) faithfully implements design §9.1: single READ COMMITTED txn, idempotency key inserted FIRST, locks both accounts in ascending id order FOR UPDATE, re-reads balance under lock, rejects insufficient (amount+fee) before any fraud evaluation, fraud rules run after the funds check under the locks, insert-only balanced ledger entries, stored-balance updates, audit, and the HELD branch commits with zero ledger entries. Matches §9.1/§9.1.1/§9.1.2 exactly."
+    },
+    {
+      "severity": "info",
+      "detail": "Idempotency (FEAT-004) matches §11: insert-key-first inside the txn; replay detected SOLELY by the UNIQUE(user_id,key) 23505 violation (no in_progress SELECT); two-case semantics (committed -> replay saved body byte-for-byte; rolled-back -> no key persists, re-execute); body-hash mismatch -> 422; missing/invalid UUID key on the three money POSTs -> 400 before DB work."
+    },
+    {
+      "severity": "info",
+      "detail": "Reconciliation (src/services/reconciliationService.ts) matches §13: job_locks FOR UPDATE NOWAIT is the FIRST statement (55P03 -> locked -> 409 RECON_LOCKED, no scan), all five checks run in one REPEATABLE READ txn, report-only (no fix UPDATE/DELETE), orphan sub-check restricted to status IN ('COMPLETED','REVERSED') so HELD/FAILED/PENDING never add a false problem, keeping AC-6's exactly-3 count deterministic."
+    },
+    {
+      "severity": "info",
+      "detail": "Fraud rules + HELD/release match §14/§9.1.1: seed 0015 pins single_over_max->hold, velocity->hold, rapid_drain->flag with the §20.3-H thresholds; evaluateRisk runs under lock after funds; releaseTransfer re-locks, re-checks funds, HELD->COMPLETED or HELD->FAILED (422), second call -> 409 TRANSFER_NOT_HELD. Deferred per-transfer balance CONSTRAINT TRIGGER (0014) and insert-only trigger+REVOKE (0013) are present and DB-enforced."
+    },
+    {
+      "severity": "info",
+      "detail": "LLM mock is deterministic and prompt-injection scope holds: statement-ask SQL in src/services/statementService.ts is built entirely in code with pathUserId bound as a parameter across all query types; the LLM only returns JSON validated in code against the 4-type schema (invalid -> 422). Note/question content cannot widen account scope (AC-10)."
+    },
+    {
+      "severity": "info",
+      "detail": "Migrations build the full schema from empty in dependency order (0001-0015), idempotent on re-run; seed pins system accounts at balance 0 with zero opening entries (recon check (c) baseline 0==0). docker-compose (db+api+worker, migrate-on-startup, dist/src/*.js), Dockerfile, and CI (postgres:15 service, typecheck+build+migrate+vitest, LLM_PROVIDER=mock) are all present and consistent with the build-path reconciliation. README answers every required design question and includes the routes/errors table, trade-offs, what-I'd-do-next, and the 5-minute demo script."
+    },
+    {
+      "severity": "info",
+      "detail": "Independently verified in this environment: `tsc --noEmit` EXIT 0 with zero diagnostics; `vitest run` -> 33 unit tests pass and all 29 Postgres-backed integration tests skip cleanly (describe.skipIf(SKIP_INTEGRATION) because DATABASE_URL is unset). This matches every FEAT-00*.json record — no fabricated pass. The final commit 03c1c16 genuinely fixed the stampede test to use randomUUID() per request (confirmed in test/integration/stampede.test.ts), resolving the FEAT-004 UUID-key ordering flag."
+    },
+    {
+      "severity": "info",
+      "detail": "Honest documentation of unrun checks: README 'Verification status' and all six FEAT files state plainly that Docker/Postgres are unavailable here, that the AC-1..AC-17 integration/acceptance tests were authored and typecheck-clean but NOT executed against a real Postgres, and that CI is where they run end to end. This is the only category of unrun checks and it is documented truthfully, satisfying the APPROVED condition."
+    },
+    {
+      "severity": "nit",
+      "detail": "Non-blocking: ASK_FIXTURE in src/llm/mockClient.ts contains 9 entries (questions 1-9); AC-11's 10th question ('what is the weather today?') is intentionally handled by the no-match fallthrough to {type:99} -> 422 UNSUPPORTED_QUESTION, exactly as design §10.1 specifies ('no entry and falls through'). All four query types, the empty-range zero case, and the unsupported case are covered. No action required; a one-line comment noting the 10th case lives in the fallthrough would aid future readers."
+    }
+  ]
+}

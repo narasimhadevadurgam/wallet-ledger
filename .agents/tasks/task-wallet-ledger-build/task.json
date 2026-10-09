@@ -1,0 +1,7 @@
+{
+  "task_id": "task-wallet-ledger-build",
+  "task_description": "Build the entire payments-grade wallet ledger per docs/design.md (schema.md authoritative where they disagree): Node.js + TypeScript strict, PostgreSQL 15+ raw SQL money path, Express API + node-cron reconciliation worker, hand-rolled ordered .sql migrations, Vitest against real Postgres, Mock+Ollama LlmClient, docker compose, GitHub Actions CI, seed script, and the README deliverable. Milestones M1 schema+migrations, M2 transfer money path + isolation lab, M3 idempotency, M4 reconciliation worker, M5 fraud rules + LLM, then STEP-4 real verification and README. The design is NOT re-derived or re-reviewed.",
+  "status": "pending",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006"],
+  "blocked_reason": null
+}
