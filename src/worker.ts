@@ -2,7 +2,10 @@ import cron from "node-cron";
 import { loadConfig } from "./config/env.js";
 import { createPool } from "./db/pool.js";
 import { runMigrations } from "./db/migrateRunner.js";
+import { createLlmClient } from "./llm/factory.js";
+import type { LlmClient } from "./llm/LlmClient.js";
 import { run as runReconciliation } from "./services/reconciliationService.js";
+import { explainFlagsForDay } from "./services/riskService.js";
 
 /**
  * Worker entrypoint (design §5, §13, §16). Shares the codebase with the API but
@@ -21,6 +24,11 @@ import { run as runReconciliation } from "./services/reconciliationService.js";
 async function main(): Promise<void> {
   const config = loadConfig();
   const pool = createPool(config.DATABASE_URL);
+  const llm = createLlmClient({
+    provider: config.LLM_PROVIDER,
+    ollamaUrl: config.OLLAMA_URL,
+    ollamaModel: config.OLLAMA_MODEL,
+  });
 
   const { applied } = await runMigrations(pool);
   if (applied.length > 0) {
@@ -33,9 +41,31 @@ async function main(): Promise<void> {
 
   cron.schedule(config.RECON_CRON, () => {
     void runScheduled(pool, config.IDEMPOTENCY_CLEANUP_HOURS);
+    void runFlagExplanations(pool, llm);
   });
 
   console.log(`wallet-ledger worker started; reconciliation cron: ${config.RECON_CRON}`);
+}
+
+/**
+ * Nightly LLM explanation step (design §14 Part B). For each risk_flags row
+ * created today that is not yet explained, asks the LLM (mock by default) to
+ * explain the firing rule and classify it, then stores the result. Errors are
+ * caught and logged so a model hiccup never crashes the worker.
+ */
+async function runFlagExplanations(
+  pool: import("pg").Pool,
+  llm: LlmClient,
+): Promise<void> {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const explained = await explainFlagsForDay(pool, llm, today);
+    console.log(`nightly flag explanation: ${explained} flag(s) explained for ${today}`);
+  } catch (err) {
+    console.error(
+      `nightly flag explanation threw: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /**

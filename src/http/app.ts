@@ -1,6 +1,7 @@
 import express, { type Express } from "express";
 import type { Pool } from "pg";
 import "./types.js";
+import type { LlmClient } from "../llm/LlmClient.js";
 import { errorMiddleware } from "./errors.js";
 import { requestId } from "./requestId.js";
 import { usersRouter } from "./routes/users.js";
@@ -17,13 +18,14 @@ import { adminRouter } from "./routes/admin.js";
  *   4. errorMiddleware -> LAST, renders the uniform {code,message,request_id}
  *
  * The admin router (/admin/*) is mounted by FEAT-005. The statement-ask route
- * is added by FEAT-006. Those FEATs insert their routers before the error
- * middleware the same way these do.
+ * (POST /users/{id}/statement/ask) lives on the statement router (FEAT-006)
+ * and needs an `LlmClient`; the entrypoint builds one from `LLM_PROVIDER` via
+ * the factory and passes it in. Tests inject the deterministic mock directly.
  *
  * NOTE: statementRouter is mounted LAST among the resource routers but BEFORE
  * the error middleware; the admin router is mounted alongside the others.
  */
-export function createApp(pool: Pool): Express {
+export function createApp(pool: Pool, llm: LlmClient): Express {
   const app = express();
 
   app.use(express.json());
@@ -37,7 +39,7 @@ export function createApp(pool: Pool): Express {
   app.use(usersRouter(pool));
   app.use(walletsRouter(pool));
   app.use(transfersRouter(pool));
-  app.use(statementRouter(pool));
+  app.use(statementRouter(pool, llm));
   app.use(adminRouter(pool));
 
   app.use(errorMiddleware);

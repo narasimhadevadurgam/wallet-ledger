@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import type { Pool } from "pg";
 import { runMigrations } from "../../src/db/migrateRunner.js";
 import { createApp } from "../../src/http/app.js";
+import { MockLlmClient } from "../../src/llm/mockClient.js";
 import { SKIP_INTEGRATION, createTestPool } from "./helpers.js";
 
 /**
@@ -53,7 +54,7 @@ describe.skipIf(SKIP_INTEGRATION)("stampede: 100 concurrent withdrawals (AC-1)",
        WHERE rule_name IN ('velocity', 'rapid_drain')`,
     );
 
-    const app = createApp(pool);
+    const app = createApp(pool, new MockLlmClient());
     await new Promise<void>((resolve) => {
       server = app.listen(0, resolve);
     });

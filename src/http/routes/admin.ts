@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { Pool } from "pg";
 import { run as runReconciliation } from "../../services/reconciliationService.js";
+import { releaseTransfer } from "../../services/transferService.js";
 import { AppError } from "../errors.js";
 import { idParamSchema, parseOrThrow } from "../validation.js";
 
@@ -15,10 +16,10 @@ import { idParamSchema, parseOrThrow } from "../validation.js";
  * `409 TRANSFER_NOT_HELD` status guard for release. They are therefore NOT
  * wired to `requireIdempotency`.
  *
- * The release route is a STUB here (FEAT-005): it validates the id and returns
- * `409 TRANSFER_NOT_HELD`. FEAT-006 fills in the HELD-completion money logic
- * (hold/release belongs with fraud, design §14/FR-12). FEAT-006 extends THIS
- * router (same `adminRouter(pool)` shape) rather than replacing it.
+ * The release route (FEAT-006) runs the single-transaction HELD-completion
+ * (design §9.1.1): re-lock the HELD transfer + both accounts ascending, re-check
+ * funds, write the balanced ledger entries, and transition HELD->COMPLETED
+ * (or HELD->FAILED + 422 when the sender drained since the hold).
  */
 export function adminRouter(pool: Pool): Router {
   const router = Router();
@@ -53,20 +54,24 @@ export function adminRouter(pool: Pool): Router {
   });
 
   /**
-   * Release a HELD transfer (FEAT-006). STUB for now: validate the id, then
-   * return `409 TRANSFER_NOT_HELD`. FEAT-006 replaces the body with the
-   * single-transaction release (re-lock, re-check funds, write ledger entries,
-   * audit HELD->COMPLETED or HELD->FAILED) per design §9.1.1.
+   * Release a HELD transfer (design §9.1.1 / FR-12). Idempotency-exempt: a
+   * second call sees a non-HELD row and returns `409 TRANSFER_NOT_HELD`. An
+   * insufficient-funds release transitions the transfer to FAILED and returns
+   * `422 INSUFFICIENT_FUNDS`.
    */
   router.post("/admin/transfers/:id/release", async (req, res, next) => {
     try {
-      parseOrThrow(idParamSchema, req.params);
-      // FEAT-006 implements the money path; until then a release is a no-op
-      // conflict (the transfer is not in a releasable HELD state we can honor).
-      throw new AppError(
-        "TRANSFER_NOT_HELD",
-        "release is not available until the hold/release flow is implemented",
-      );
+      const { id } = parseOrThrow(idParamSchema, req.params);
+      const result = await releaseTransfer(pool, id, "admin");
+      res.status(200).json({
+        transfer_id: result.transfer_id,
+        status: result.status,
+        type: result.type,
+        amount: result.amount,
+        fee: result.fee,
+        wallet_balance: result.wallet_balance,
+        request_id: req.request_id,
+      });
     } catch (err) {
       next(err);
     }

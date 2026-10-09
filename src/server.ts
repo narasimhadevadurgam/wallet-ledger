@@ -2,6 +2,7 @@ import { loadConfig } from "./config/env.js";
 import { createPool } from "./db/pool.js";
 import { runMigrations } from "./db/migrateRunner.js";
 import { createApp } from "./http/app.js";
+import { createLlmClient } from "./llm/factory.js";
 
 /**
  * API entrypoint. Build the pool from env, apply migrations to completion, and
@@ -17,7 +18,13 @@ async function main(): Promise<void> {
     console.log(`Migrations applied: ${applied.join(", ")}`);
   }
 
-  const app = createApp(pool);
+  const llm = createLlmClient({
+    provider: config.LLM_PROVIDER,
+    ollamaUrl: config.OLLAMA_URL,
+    ollamaModel: config.OLLAMA_MODEL,
+  });
+
+  const app = createApp(pool, llm);
   app.listen(config.PORT, () => {
     console.log(`wallet-ledger API listening on port ${config.PORT}`);
   });

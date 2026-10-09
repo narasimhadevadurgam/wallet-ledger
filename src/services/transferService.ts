@@ -3,6 +3,7 @@ import { withTransaction } from "../db/query.js";
 import { AppError } from "../http/errors.js";
 import { serializeAmount } from "../money/money.js";
 import { writeTransferAudit } from "./auditService.js";
+import { evaluateRisk, writeRiskFlag } from "./riskService.js";
 import {
   getSystemAccount,
   type AccountRecord,
@@ -102,11 +103,6 @@ export interface TransferResult {
 export type TransferOutcome =
   | { kind: "executed"; result: TransferResult; response?: TransferResponse }
   | { kind: "replay"; response: TransferResponse };
-
-/** The fraud-seam outcome. FEAT-005 fills in HELD / flag; today always proceed. */
-type FraudDecision =
-  | { decision: "proceed" }
-  | { decision: "hold"; ruleName: string };
 
 /** Postgres SQLSTATE for a unique-violation (the UNIQUE(user_id,key) conflict). */
 const UNIQUE_VIOLATION = "23505";
@@ -227,22 +223,6 @@ async function resolveReplay(
     );
   }
   return { code: row.response_code, body: row.response_body };
-}
-
-/**
- * FEAT-005 SEAM. Evaluate fraud rules inside the txn, under the FOR UPDATE
- * locks, AFTER the funds check and BEFORE any ledger write (design §9.1 step 6).
- * No-op until FEAT-005: always proceeds. FEAT-005 replaces the body; the call
- * site below does not move.
- */
-async function evaluateFraud(
-  _client: PoolClient,
-  _ctx: TransferContext,
-  _fee: bigint,
-): Promise<FraudDecision> {
-  // FEAT-005: load enabled risk_rules, evaluate each predicate under lock;
-  // 'hold' rule -> return { decision: 'hold', ruleName }; 'flag' -> record and proceed.
-  return { decision: "proceed" };
 }
 
 /** Read the configured flat fee (paise) from the config table; defaults to 0. */
@@ -375,19 +355,26 @@ async function runTransferTxn(
         );
       }
 
-      // --- STEP 6 (FEAT-005 seam): fraud evaluation under lock, post-funds ---
-      const fraud = await evaluateFraud(client, ctx, fee);
-      if (fraud.decision === "hold") {
-        // FEAT-005 completes this branch (write risk_flags, commit with no
-        // ledger entries). The structural shape is here so FEAT-005 extends it.
+      // --- STEP 6 (design §9.1 step 6 / §14): fraud rules under lock, post-funds ---
+      // Rules are evaluated AFTER the funds check and BEFORE any ledger write,
+      // with both account rows held FOR UPDATE. The source account funds the
+      // outflow, so it is the wallet the velocity / rapid-drain rules observe.
+      const risk = await evaluateRisk(client, {
+        sourceAccountId: ctx.fromAccountId,
+        amount: ctx.amount,
+      });
+      if (risk.decision === "hold") {
+        // A fired 'hold' rule: write the transfer HELD, record the risk flag,
+        // audit NULL->HELD, and COMMIT with NO ledger entries / NO balance
+        // change (design §9.1 step 6 / §9.1.1). Money moves only on release.
         const transferId = await insertTransfer(client, ctx, "HELD");
+        await writeRiskFlag(client, transferId, risk.ruleName);
         await writeTransferAudit(client, {
           transferId,
           oldStatus: null,
           newStatus: "HELD",
           actor: ctx.actor,
         });
-        // No ledger entries, no balance change on HELD (design §9.1.1).
         const result: TransferResult = {
           transfer_id: transferId.toString(),
           status: "HELD",
@@ -401,6 +388,12 @@ async function runTransferTxn(
 
       // --- STEP 7: insert the transfers row (COMPLETED) ---
       const transferId = await insertTransfer(client, ctx, "COMPLETED");
+
+      // A fired 'flag' rule (allow-with-flag): record each flag against the now
+      // -created transfer and PROCEED to move money (design §9.1 step 6).
+      for (const ruleName of risk.flagged) {
+        await writeRiskFlag(client, transferId, ruleName);
+      }
 
       // --- STEP 8: insert balanced ledger entries ---
       // Primary pair: debit source, credit dest, for `amount`.
@@ -465,6 +458,142 @@ async function finishTransfer(
   const response = ctx.idempotency.buildResponse(result);
   await completeIdempotencyKey(client, ctx.idempotency, response);
   return { kind: "executed", result, response };
+}
+
+/** A HELD transfers row as the release path reads it (money as strings from pg). */
+interface HeldTransferRow {
+  id: string;
+  type: TransferType | "reversal";
+  status: string;
+  amount: string;
+  from_account_id: string;
+  to_account_id: string;
+}
+
+/** The successful release result returned to the admin route. */
+export interface ReleaseResult {
+  transfer_id: string;
+  status: "COMPLETED";
+  type: string;
+  amount: string;
+  fee: string;
+  /** The sender wallet's balance after the release, as a string. */
+  wallet_balance: string;
+}
+
+/**
+ * Release a HELD transfer (design §9.1.1, FR-12). ONE transaction at READ
+ * COMMITTED that:
+ *   1. locks the HELD transfer row AND both its accounts FOR UPDATE, ascending
+ *      by account id (the same deadlock-avoidance order as the money path);
+ *   2. 409 TRANSFER_NOT_HELD if the transfer is not currently HELD (covers the
+ *      not-found, already-released, and second-call cases);
+ *   3. re-reads balances under lock and re-checks funds (balance >= amount +
+ *      fee). If insufficient, transitions HELD->FAILED, audits, and throws
+ *      422 INSUFFICIENT_FUNDS (the transfer stays FAILED — the only FAILED path);
+ *   4. otherwise inserts the balanced ledger entries, updates stored balances
+ *      (exactly as the money path steps 8-9), transitions HELD->COMPLETED,
+ *      audits, and commits.
+ *
+ * Idempotency-exempt: a second call sees a non-HELD row and 409s.
+ */
+export async function releaseTransfer(
+  pool: Pool,
+  transferId: bigint,
+  actor: string,
+): Promise<ReleaseResult> {
+  return withTransaction(
+    pool,
+    async (client): Promise<ReleaseResult> => {
+      // --- 1a: lock the transfer row FOR UPDATE ---
+      const txResult = await client.query<HeldTransferRow>(
+        `SELECT id, type, status, amount, from_account_id, to_account_id
+         FROM transfers WHERE id = $1 FOR UPDATE`,
+        [transferId.toString()],
+      );
+      const transfer = txResult.rows[0];
+      // --- 2: must still be HELD (not-found / already-released -> 409) ---
+      if (!transfer || transfer.status !== "HELD") {
+        throw new AppError(
+          "TRANSFER_NOT_HELD",
+          `transfer ${transferId} is not in a releasable HELD state`,
+        );
+      }
+
+      const fromId = BigInt(transfer.from_account_id);
+      const toId = BigInt(transfer.to_account_id);
+      const amount = BigInt(transfer.amount);
+
+      // --- 1b: lock both accounts ascending by id (deadlock-avoidance order) ---
+      const locked = await lockAccountsAscending(client, [fromId, toId]);
+      const source = locked.get(fromId.toString());
+      const dest = locked.get(toId.toString());
+      if (!source || !dest) {
+        throw new AppError("INTERNAL", `release: account rows missing for transfer ${transferId}`);
+      }
+
+      // Fee is recomputed from current config, as at hold time, for peer transfers.
+      const fee = transfer.type === "peer_transfer" ? await readFeePaise(client) : 0n;
+      const outflow = amount + fee;
+
+      // --- 3: re-check funds under lock; insufficient -> HELD->FAILED + 422 ---
+      const sourceBalance = BigInt(source.balance);
+      if (!source.is_system && sourceBalance < outflow) {
+        await client.query(
+          `UPDATE transfers SET status = 'FAILED' WHERE id = $1`,
+          [transferId.toString()],
+        );
+        await writeTransferAudit(client, {
+          transferId,
+          oldStatus: "HELD",
+          newStatus: "FAILED",
+          actor,
+        });
+        throw new AppError(
+          "INSUFFICIENT_FUNDS",
+          `insufficient funds to release transfer ${transferId}: balance ${source.balance} < required ${outflow.toString()}`,
+        );
+      }
+
+      // --- 4: balanced ledger entries + stored balances (as money path 8-9) ---
+      await insertLedgerEntry(client, transferId, fromId, "debit", amount);
+      await insertLedgerEntry(client, transferId, toId, "credit", amount);
+      let feeRevenueId: bigint | null = null;
+      if (fee > 0n) {
+        const feeRevenue = await getSystemAccount(client, "fee_revenue");
+        feeRevenueId = BigInt(feeRevenue.id);
+        await insertLedgerEntry(client, transferId, fromId, "debit", fee);
+        await insertLedgerEntry(client, transferId, feeRevenueId, "credit", fee);
+      }
+      await adjustBalance(client, fromId, -outflow);
+      await adjustBalance(client, toId, amount);
+      if (fee > 0n && feeRevenueId !== null) {
+        await adjustBalance(client, feeRevenueId, fee);
+      }
+
+      // --- transition HELD -> COMPLETED, audit, commit ---
+      await client.query(
+        `UPDATE transfers SET status = 'COMPLETED' WHERE id = $1`,
+        [transferId.toString()],
+      );
+      await writeTransferAudit(client, {
+        transferId,
+        oldStatus: "HELD",
+        newStatus: "COMPLETED",
+        actor,
+      });
+
+      return {
+        transfer_id: transferId.toString(),
+        status: "COMPLETED",
+        type: transfer.type,
+        amount: serializeAmount(amount),
+        fee: serializeAmount(fee),
+        wallet_balance: (sourceBalance - outflow).toString(),
+      };
+    },
+    { isolationLevel: "READ COMMITTED" },
+  );
 }
 
 async function insertTransfer(
